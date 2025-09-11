@@ -390,6 +390,12 @@ static int analog_unalloc_sub(struct analog_pvt *p, enum analog_sub x)
 
 static int analog_send_callerid(struct analog_pvt *p, int cwcid, struct ast_party_caller *caller)
 {
+	/* If Caller ID is disabled for the line, that means we do not send ANY spill whatsoever. */
+	if (!p->use_callerid) {
+		ast_debug(1, "Caller ID is disabled for channel %d, skipping spill\n", p->channel);
+		return 0;
+	}
+
 	ast_debug(1, "Sending callerid.  CID_NAME: '%s' CID_NUM: '%s'\n",
 		caller->id.name.str,
 		caller->id.number.str);
@@ -862,6 +868,16 @@ int analog_available(struct analog_pvt *p)
 static int analog_stop_callwait(struct analog_pvt *p)
 {
 	p->callwaitcas = 0;
+
+	/* There are 3 scenarios in which we need to reset the dialmode to permdialmode.
+	 * 1) When placing a new outgoing call (either the first or a three-way)
+	 * 2) When receiving a new incoming call
+	 *   2A) If it's the first incoming call (not a call waiting), we reset
+	 *       in dahdi_hangup.
+	 *   2B ) If it's a call waiting we've answered, either by swapping calls
+	 *        or having it ring through, we call analog_stop_callwait. That's this! */
+	p->dialmode = p->permdialmode;
+
 	if (analog_callbacks.stop_callwait) {
 		return analog_callbacks.stop_callwait(p->chan_pvt);
 	}
@@ -2372,6 +2388,29 @@ static void *__analog_ss_thread(void *data)
 		 */
 		p->hidecallerid = p->permhidecallerid;
 
+		/* Set the default dial mode.
+		 * As with Caller ID, this is independent for each call,
+		 * and changes made using the CHANNEL function are only temporary.
+		 * This reset ensures temporary changes are discarded when a new call is originated.
+		 *
+		 * XXX There is a slight edge case in that because the dialmode is reset to permdialmode,
+		 * assuming permdialmode=both, if a user disables dtmf during call 1, then flashes and
+		 * starts call 2, this will set dialmode back to permcallmode on the private,
+		 * allowing tone dialing to (correctly) work on call 2.
+		 * If the user flashes back to call 1, however, tone dialing will again work on call 1.
+		 *
+		 * This problem does not exist with the other settings that involve a "permanent"
+		 * and "transient" settings (e.g. hidecallerid, callwaiting), because hidecallerid
+		 * only matters when originating a call, so as soon as it's been placed, it doesn't
+		 * matter if it gets reset. For callwaiting, the setting is supposed to be common
+		 * to the entire channel private (all subchannels), which is NOT the case with this setting.
+		 *
+		 * The correct and probably only fix for this edge case is to move dialmode out of the channel private
+		 * (which is shared by all subchannels), and into the Asterisk channel structure. Just using an array for
+		 * each chan_dahdi subchannel won't work because the indices change as calls flip around.
+		 */
+		p->dialmode = p->permdialmode;
+
 		/* Read the first digit */
 		timeout = analog_get_firstdigit_timeout(p);
 		/* If starting a threeway call, never timeout on the first digit so someone
@@ -3168,6 +3207,10 @@ static struct ast_frame *__analog_handle_event(struct analog_pvt *p, struct ast_
 				ast_debug(2, "Letting this call hang up normally, since it's not the only call\n");
 			} else if (!p->owner || !p->subs[ANALOG_SUB_REAL].owner || ast_channel_state(ast) != AST_STATE_UP) {
 				ast_debug(2, "Called Subscriber Held does not apply: channel state is %d\n", ast_channel_state(ast));
+			} else if (p->owner && p->subs[ANALOG_SUB_REAL].owner && ast_strlen_zero(ast_channel_appl(p->subs[ANALOG_SUB_REAL].owner))) {
+				/* If the channel application is empty, it is likely a masquerade has occured, in which case don't hold any calls.
+				 * This conditional matches only executions that would have reached the strcmp below. */
+				ast_debug(1, "Skipping Called Subscriber Held; channel has no application\n");
 			} else if (!p->owner || !p->subs[ANALOG_SUB_REAL].owner || strcmp(ast_channel_appl(p->subs[ANALOG_SUB_REAL].owner), "AppDial")) {
 				/* Called Subscriber held only applies to incoming calls, not outgoing calls.
 				 * We can't use p->outgoing because that is always true, for both incoming and outgoing calls, so it's not accurate.

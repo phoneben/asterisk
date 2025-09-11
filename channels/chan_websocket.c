@@ -31,6 +31,61 @@
 	<support_level>core</support_level>
  ***/
 
+/*** DOCUMENTATION
+	<info name="Dial_Resource" language="en_US" tech="WebSocket">
+		<para>WebSocket Dial Strings:</para>
+		<para><literal>Dial(WebSocket/connectionid[/websocket_options])</literal></para>
+		<para>WebSocket Parameters:</para>
+		<enumlist>
+			<enum name="connectionid">
+				<para>For outgoing WebSockets, this is the ID of the connection
+				in websocket_client.conf to use for the call.  To accept incoming
+				WebSocket connections use the literal <literal>INCOMING</literal></para>
+			</enum>
+			<enum name="websocket_options">
+				<para>Options to control how the WebSocket channel behaves.</para>
+				<enumlist>
+					<enum name="c(codec) - Specify the codec to use in the channel">
+						<para></para>
+						<para> If not specified, the first codec from the caller's channel will be used.
+						</para>
+					</enum>
+					<enum name="n - Don't auto answer">
+						<para>Normally, the WebSocket channel will be answered when
+						connection is established with the remote app.  If this
+						option is specified however, the channel will not be
+						answered until the <literal>ANSWER</literal> command is
+						received from the remote app or the remote app calls the
+						/channels/answer ARI endpoint.
+						</para>
+					</enum>
+					<enum name="v(uri_parameters) - Add parameters to the outbound URI">
+						<para>This option allows you to add additional parameters to the
+						outbound URI.  The format is:
+						<literal>v(param1=value1,param2=value2...)</literal>
+						</para>
+						<para>You must ensure that no parameter name or value contains
+						characters not valid in a URL.  The easiest way to do this is to
+						use the URIENCODE() dialplan function to encode them.  Be aware
+						though that each name and value must be encoded separately.  You
+						can't simply encode the whole string.</para>
+					</enum>
+				</enumlist>
+			</enum>
+		</enumlist>
+		<para>Examples:
+		</para>
+		<example title="Make an outbound WebSocket connection using connection 'connection1' and the 'sln16' codec.">
+		same => n,Dial(WebSocket/connection1/c(sln16))
+		</example>
+		<example title="Listen for an incoming WebSocket connection and don't auto-answer it.">
+		same => n,Dial(WebSocket/INCOMING/n)
+		</example>
+		<example title="Add URI parameters.">
+		same => n,Dial(WebSocket/connection1/v(${URIENCODE(vari able)}=${URIENCODE(${CHANNEL})},variable2=$(URIENCODE(${EXTEN})}))
+		</example>
+	</info>
+***/
 #include "asterisk.h"
 
 #include "asterisk/app.h"
@@ -69,6 +124,7 @@ struct websocket_pvt {
 	pthread_t outbound_read_thread;
 	size_t bytes_read;
 	size_t leftover_len;
+	char *uri_params;
 	char *leftover_data;
 	int no_auto_answer;
 	int optimal_frame_size;
@@ -100,6 +156,7 @@ struct websocket_pvt {
 #define QUEUE_DRAINED "QUEUE_DRAINED"
 #define DRIVER_STATUS "STATUS"
 #define MEDIA_BUFFERING_COMPLETED "MEDIA_BUFFERING_COMPLETED"
+#define DTMF_END "DTMF_END"
 
 #define QUEUE_LENGTH_MAX 1000
 #define QUEUE_LENGTH_XOFF_LEVEL 900
@@ -112,6 +169,7 @@ static int webchan_call(struct ast_channel *ast, const char *dest, int timeout);
 static struct ast_frame *webchan_read(struct ast_channel *ast);
 static int webchan_write(struct ast_channel *ast, struct ast_frame *f);
 static int webchan_hangup(struct ast_channel *ast);
+static int webchan_send_dtmf_text(struct ast_channel *ast, char digit, unsigned int duration);
 
 static struct ast_channel_tech websocket_tech = {
 	.type = "WebSocket",
@@ -121,6 +179,7 @@ static struct ast_channel_tech websocket_tech = {
 	.read = webchan_read,
 	.write = webchan_write,
 	.hangup = webchan_hangup,
+	.send_digit_end = webchan_send_dtmf_text,
 };
 
 static void set_channel_format(struct websocket_pvt * instance,
@@ -421,12 +480,14 @@ static int process_text_message(struct websocket_pvt *instance,
 	}
 
 	/*
-	 * This is safe because the payload buffer is always >= 8K
-	 * even with LOW_MEMORY defined and we've already made sure the
-	 * command is less than 128 bytes.
+	 * Unfortunately, payload is not NULL terminated even when it's
+	 * a TEXT frame so we need to allocate a new buffer, copy
+	 * the data into it, and NULL terminate it.
 	 */
-	payload[payload_len] = '\0';
-	command = ast_strip(ast_strdupa(payload));
+	command = ast_alloca(payload_len + 1);
+	memcpy(command, payload, payload_len); /* Safe */
+	command[payload_len] = '\0';
+	command = ast_strip(command);
 
 	ast_debug(4, "%s: WebSocket %s command received\n",
 		ast_channel_name(instance->channel), command);
@@ -825,6 +886,10 @@ static int webchan_call(struct ast_channel *ast, const char *dest,
 	ast_debug(3, "%s: WebSocket call requested to %s. cid: %s\n",
 		ast_channel_name(ast), dest, instance->connection_id);
 
+	if (!ast_strlen_zero(instance->uri_params)) {
+		ast_websocket_client_add_uri_params(instance->client, instance->uri_params);
+	}
+
 	instance->websocket = ast_websocket_client_connect(instance->client,
 		instance, ast_channel_name(ast), &result);
 	if (!instance->websocket || result != WS_OK) {
@@ -907,6 +972,8 @@ static void websocket_destructor(void *data)
 		ast_free(instance->leftover_data);
 		instance->leftover_data = NULL;
 	}
+
+	ast_free(instance->uri_params);
 }
 
 struct instance_proxy {
@@ -1097,20 +1164,50 @@ static int set_channel_variables(struct websocket_pvt *instance)
 	return 0;
 }
 
+static int validate_uri_parameters(const char *uri_params)
+{
+	char *params = ast_strdupa(uri_params);
+	char *nvp = NULL;
+	char *nv = NULL;
+
+	/*
+	 * uri_params should be a comma-separated list of key=value pairs.
+	 * For example:
+	 * name1=value1,name2=value2
+	 * We're verifying that each name and value either doesn't need
+	 * to be encoded or that it already is.
+	 */
+
+	while((nvp = ast_strsep(&params, ',', 0))) {
+		/* nvp will be name1=value1 */
+		while((nv = ast_strsep(&nvp, '=', 0))) {
+			/* nv will be either name1 or value1 */
+			if (!ast_uri_verify_encoded(nv)) {
+				return 0;
+			}
+		}
+	}
+
+	return 1;
+}
+
 enum {
 	OPT_WS_CODEC =  (1 << 0),
 	OPT_WS_NO_AUTO_ANSWER =  (1 << 1),
+	OPT_WS_URI_PARAM =  (1 << 2),
 };
 
 enum {
 	OPT_ARG_WS_CODEC,
 	OPT_ARG_WS_NO_AUTO_ANSWER,
+	OPT_ARG_WS_URI_PARAM,
 	OPT_ARG_ARRAY_SIZE
 };
 
 AST_APP_OPTIONS(websocket_options, BEGIN_OPTIONS
 	AST_APP_OPTION_ARG('c', OPT_WS_CODEC, OPT_ARG_WS_CODEC),
 	AST_APP_OPTION('n', OPT_WS_NO_AUTO_ANSWER),
+	AST_APP_OPTION_ARG('v', OPT_WS_URI_PARAM, OPT_ARG_WS_URI_PARAM),
 	END_OPTIONS );
 
 static struct ast_channel *webchan_request(const char *type,
@@ -1185,6 +1282,42 @@ static struct ast_channel *webchan_request(const char *type,
 
 	instance->no_auto_answer = ast_test_flag(&opts, OPT_WS_NO_AUTO_ANSWER);
 
+	if (ast_test_flag(&opts, OPT_WS_URI_PARAM)
+		&& !ast_strlen_zero(opt_args[OPT_ARG_WS_URI_PARAM])) {
+		char *comma;
+
+		if (ast_strings_equal(args.connection_id, INCOMING_CONNECTION_ID)) {
+			ast_log(LOG_ERROR,
+				"%s: URI parameters are not allowed for 'WebSocket/INCOMING' channels\n",
+				requestor_name);
+			goto failure;
+		}
+
+		ast_debug(3, "%s: Using URI parameters '%s'\n",
+			requestor_name, opt_args[OPT_ARG_WS_URI_PARAM]);
+
+		if (!validate_uri_parameters(opt_args[OPT_ARG_WS_URI_PARAM])) {
+			ast_log(LOG_ERROR, "%s: Invalid URI parameters '%s' in WebSocket/%s dial string\n",
+				requestor_name, opt_args[OPT_ARG_WS_URI_PARAM],
+				args.connection_id);
+			goto failure;
+		}
+
+		instance->uri_params = ast_strdup(opt_args[OPT_ARG_WS_URI_PARAM]);
+		comma = instance->uri_params;
+		/*
+		 * The normal separator for query string components is an
+		 * ampersand ('&') but the Dial app interprets them as additional
+		 * channels to dial in parallel so we instruct users to separate
+		 * the parameters with commas (',') instead.  We now have to
+		 * convert those commas back to ampersands.
+		 */
+		while ((comma = strchr(comma,','))) {
+			*comma = '&';
+		}
+		ast_debug(3, "%s: Using final URI '%s'\n", requestor_name, instance->uri_params);
+	}
+
 	chan = ast_channel_alloc(1, AST_STATE_DOWN, "", "", "", "", "", assignedids,
 		requestor, 0, "WebSocket/%s/%p", args.connection_id, instance);
 	if (!chan) {
@@ -1244,7 +1377,6 @@ failure:
 	return NULL;
 }
 
-
 /*!
  * \internal
  *
@@ -1279,6 +1411,32 @@ static int webchan_hangup(struct ast_channel *ast)
 	ao2_cleanup(instance);
 
 	return 0;
+}
+
+static int webchan_send_dtmf_text(struct ast_channel *ast, char digit, unsigned int duration)
+{
+		struct websocket_pvt *instance = ast_channel_tech_pvt(ast);
+		char *command;
+		int res = 0;
+
+		if (!instance) {
+			return -1;
+		}
+
+		res = ast_asprintf(&command, "%s digit:%c", DTMF_END, digit);
+		if (res <= 0 || !command) {
+			ast_log(LOG_ERROR, "%s: Failed to create DTMF_END\n", ast_channel_name(instance->channel));
+			return 0;
+		}
+		res = ast_websocket_write_string(instance->websocket, command);
+		if (res != 0) {
+			ast_log(LOG_ERROR, "%s: Failed to send DTMF_END\n", ast_channel_name(instance->channel));
+			ast_free(command);
+			return 0;
+		}
+		ast_debug(3, "%s: Sent %s\n", ast_channel_name(instance->channel), command);
+		ast_free(command);
+		return 0;
 }
 
 /*!
